@@ -1,0 +1,13 @@
+train_allowed:
+  res: ["MONOD", "HILL"]
+  light: ["SMITH", "LINEAR"]
+  temp: ["Q10", "CONST"]
+  loss: ["LINEAR", "QUADRATIC"]
+  dec: ["LINEAR", "SATURATING"]
+
+heldout_2c:
+  res: ["HALDANE"]
+  light: ["STEELE"]
+  temp: ["GAUSSIAN"]
+  loss: ["LINEAR", "QUADRATIC"]
+  dec: ["LINEAR", "SATURATING"]

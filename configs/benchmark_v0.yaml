@@ -1,0 +1,81 @@
+version: "v0.1.0"
+master_seed: 20260101
+chunk_size: 32
+timeout_seconds: 10.0
+
+splits:
+  train:
+    total: 4000
+    shape_mode: "train"
+    interv_regime: "train"
+    groups:
+      - {name: "river", count: 800, group_id: 101}
+      - {name: "lake", count: 800, group_id: 102}
+      - {name: "terrestrial", count: 800, group_id: 103}
+      - {name: "foodweb", count: 800, group_id: 104}
+      - {name: "chemostat", count: 800, group_id: 105}
+
+  val:
+    total: 400
+    shape_mode: "train"
+    interv_regime: "train"
+    groups:
+      - {name: "river", count: 80, group_id: 201}
+      - {name: "lake", count: 80, group_id: 202}
+      - {name: "terrestrial", count: 80, group_id: 203}
+      - {name: "foodweb", count: 80, group_id: 204}
+      - {name: "chemostat", count: 80, group_id: 205}
+
+  test_1_obs:
+    total: 300
+    shape_mode: "train"
+    interv_regime: "train"
+    groups:
+      - {name: "river", count: 60, group_id: 301}
+      - {name: "lake", count: 60, group_id: 302}
+      - {name: "terrestrial", count: 60, group_id: 303}
+      - {name: "foodweb", count: 60, group_id: 304}
+      - {name: "chemostat", count: 60, group_id: 305}
+
+  test_2a_param:
+    total: 300
+    shape_mode: "train"
+    interv_regime: "train"
+    groups:
+      - {name: "river", count: 60, group_id: 401}
+      - {name: "lake", count: 60, group_id: 402}
+      - {name: "terrestrial", count: 60, group_id: 403}
+      - {name: "foodweb", count: 60, group_id: 404}
+      - {name: "chemostat", count: 60, group_id: 405}
+
+  test_2b_comp:
+    total: 400
+    shape_mode: "train"
+    interv_regime: "train"
+    groups:
+      - {name: "river_competition", count: 100, group_id: 501}
+      - {name: "lake_cascade", count: 100, group_id: 502}
+      - {name: "terrestrial_cascade", count: 100, group_id: 503}
+      - {name: "chemostat_detritus_recycle", count: 100, group_id: 504}
+
+  test_2c_shape:
+    total: 300
+    shape_mode: "heldout_2c"
+    interv_regime: "train"
+    groups:
+      - {name: "river", count: 60, group_id: 601}
+      - {name: "lake", count: 60, group_id: 602}
+      - {name: "terrestrial", count: 60, group_id: 603}
+      - {name: "foodweb", count: 60, group_id: 604}
+      - {name: "chemostat", count: 60, group_id: 605}
+
+  test_3_interv:
+    total: 300
+    shape_mode: "train"
+    interv_regime: "ood"
+    groups:
+      - {name: "river", count: 60, group_id: 701}
+      - {name: "lake", count: 60, group_id: 702}
+      - {name: "terrestrial", count: 60, group_id: 703}
+      - {name: "foodweb", count: 60, group_id: 704}
+      - {name: "chemostat", count: 60, group_id: 705}

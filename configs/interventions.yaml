@@ -1,0 +1,35 @@
+t_int: 180.0
+
+regimes:
+  train:
+    nutrient_step:
+      lambda_N_ranges: [[0.6, 0.85], [1.15, 1.6]]
+    warming_shift:
+      delta_T_ranges: [[-1.5, -0.5], [0.5, 2.0]]
+    flow_regime:
+      lambda_q_range: [0.6, 1.5]
+      lambda_storm_range: [0.5, 1.5]
+      allow_zero_storm: false
+    bio_pulse:
+      kappa_ranges: [[0.5, 0.8], [1.2, 1.8]]
+      targets: ["P1", "Z1"]
+
+  ood:
+    nutrient_step:
+      lambda_N_ranges: [[0.15, 0.4], [2.2, 4.0]]
+    warming_shift:
+      delta_T_ranges: [[3.0, 6.0]]
+    flow_regime:
+      lambda_q_range: [0.15, 0.35]
+      lambda_storm_range: [0.0, 0.2]
+      allow_zero_storm: true
+    bio_pulse:
+      kappa_ranges: [[0.05, 0.25], [2.5, 4.0]]
+      targets: ["P1", "Z1"]
+
+preset_valid_interventions:
+  river: ["nutrient_step", "warming_shift", "flow_regime", "bio_pulse"]
+  lake: ["nutrient_step", "warming_shift", "flow_regime", "bio_pulse"]
+  terrestrial: ["nutrient_step", "warming_shift", "flow_regime", "bio_pulse"]
+  foodweb: ["warming_shift", "bio_pulse"]
+  chemostat: ["nutrient_step", "flow_regime", "bio_pulse"]
