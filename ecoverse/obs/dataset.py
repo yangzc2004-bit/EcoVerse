@@ -12,8 +12,28 @@ import torch
 import zarr
 from torch.utils.data import Dataset, get_worker_info
 
+from ecoverse.core.constants import INTERV_MAP, INTERVENTION_FEATURES
+from ecoverse.core.spec import InterventionSpec
 from ecoverse.obs.normalize import Normalizer
 from ecoverse.obs.sensors import load_sensors_config, sample_observation
+
+
+def encode_intervention(action: InterventionSpec, formal_days: float) -> np.ndarray:
+    """Encode prescribed controls only. An untreated trajectory has a zero vector."""
+    vector = np.zeros(len(INTERVENTION_FEATURES), dtype=np.float32)
+    if action.type == "none":
+        return vector
+    vector[INTERV_MAP[action.type] - 1] = 1
+    vector[4] = action.t_int / formal_days
+    if action.type == "nutrient_step":
+        vector[5] = action.lambda_N - 1
+    elif action.type == "warming_shift":
+        vector[6] = action.delta_T
+    elif action.type == "flow_regime":
+        vector[7:9] = action.lambda_q - 1, action.lambda_storm - 1
+    else:
+        vector[9 if action.target_state == "P1" else 10] = action.kappa - 1
+    return vector
 
 
 class EcoVerseDataset(Dataset):
@@ -40,6 +60,8 @@ class EcoVerseDataset(Dataset):
         self.meta_path = self.data_dir / "metadata.parquet"
         self.sys_ids = [int(i) for i in sys_ids]
         self.mode = mode
+        self.is_training = mode in ("train", "counterfactual_train")
+        self.is_counterfactual = mode in ("counterfactual", "counterfactual_train")
         self.sensor_package = sensor_package
         self.num_queries = int(num_queries)
         self.max_tokens = int(max_tokens)
@@ -77,12 +99,16 @@ class EcoVerseDataset(Dataset):
         df = pd.read_parquet(self.meta_path).set_index("sys_id")
         self._eff_masks: Dict[int, np.ndarray] = {}
         self._ch_masks: Dict[int, np.ndarray] = {}
+        self._actions: Dict[int, np.ndarray] = {}
         for sid in self.sys_ids:
             row = df.loc[sid]
             self._eff_masks[sid] = np.asarray(
                 json.loads(row["effective_state_mask_json"]), dtype=bool
             )
             self._ch_masks[sid] = np.asarray(json.loads(row["channel_mask_json"]), dtype=bool)
+            if self.is_counterfactual:
+                action = InterventionSpec.model_validate_json(row["intervention_json"])
+                self._actions[sid] = encode_intervention(action, self.formal_days)
 
         # Lazy per-worker Zarr handles
         self._zarr_root: Optional[zarr.Group] = None
@@ -94,7 +120,7 @@ class EcoVerseDataset(Dataset):
         return self._zarr_root
 
     def _get_rng(self, sys_id: int) -> np.random.Generator:
-        if self.mode == "train":
+        if self.is_training:
             if self._worker_rng is None:
                 wi = get_worker_info()
                 wid = wi.id if wi is not None else 0
@@ -116,7 +142,7 @@ class EcoVerseDataset(Dataset):
         eff_mask = self._eff_masks[sid]
         ch_mask = self._ch_masks[sid]
 
-        if self.mode == "counterfactual":
+        if self.is_counterfactual:
             x_pre = np.asarray(root["x_true"][sid, : self.intervention_step], dtype=np.float32)
             u_pre = np.asarray(root["u_true"][sid, : self.intervention_step], dtype=np.float32)
             t_pre = self.t_formal_days[: self.intervention_step]
@@ -124,7 +150,6 @@ class EcoVerseDataset(Dataset):
             x_cf = np.asarray(root["x_cf"][sid], dtype=np.float32)
             r_cf = np.asarray(root["r_cf"][sid], dtype=np.float32)
             u_cf = np.asarray(root["u_cf"][sid], dtype=np.float32)
-            x_base_post = np.asarray(root["x_true"][sid, self.intervention_step :], dtype=np.float32)
 
             obs = sample_observation(
                 x_obs_window=x_pre,
@@ -144,13 +169,15 @@ class EcoVerseDataset(Dataset):
             )
 
             q_count = min(self.num_queries, self.n_steps_cf)
-            q_idx = np.linspace(0, self.n_steps_cf - 1, q_count, dtype=np.int64)
+            if self.is_training:
+                q_idx = np.sort(rng.choice(self.n_steps_cf, size=q_count, replace=False))
+            else:
+                q_idx = np.linspace(0, self.n_steps_cf - 1, q_count, dtype=np.int64)
             query_times = (self.t_cf_days[q_idx] / self.formal_days).astype(np.float32)
             target_x = self.normalizer.transform_state_matrix(x_cf[q_idx])
             target_r = r_cf[q_idx].astype(np.float32)
-            baseline_x = self.normalizer.transform_state_matrix(x_base_post[q_idx])
 
-            return {
+            item = {
                 "obs_times": torch.from_numpy(obs["obs_times"]),
                 "obs_var_ids": torch.from_numpy(obs["obs_var_ids"]),
                 "obs_values": torch.from_numpy(obs["obs_values"]),
@@ -161,9 +188,13 @@ class EcoVerseDataset(Dataset):
                 "target_r": torch.from_numpy(target_r),
                 "target_state_mask": torch.from_numpy(eff_mask.copy()),
                 "channel_mask": torch.from_numpy(ch_mask.copy()),
-                "baseline_x": torch.from_numpy(baseline_x),
+                "intervention": torch.from_numpy(self._actions[sid].copy()),
                 "sys_id": sid,
             }
+            if not self.is_training:
+                x_base_post = np.asarray(root["x_true"][sid, self.intervention_step :])
+                item["baseline_x"] = torch.from_numpy(self.normalizer.transform_state_matrix(x_base_post[q_idx]))
+            return item
 
         # Standard baseline mode ("train" or "eval")
         x_full = np.asarray(root["x_true"][sid], dtype=np.float32)
@@ -206,5 +237,6 @@ class EcoVerseDataset(Dataset):
             "target_r": torch.from_numpy(target_r),
             "target_state_mask": torch.from_numpy(eff_mask.copy()),
             "channel_mask": torch.from_numpy(ch_mask.copy()),
+            "intervention": torch.zeros(len(INTERVENTION_FEATURES), dtype=torch.float32),
             "sys_id": sid,
         }

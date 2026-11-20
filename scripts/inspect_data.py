@@ -44,12 +44,19 @@ def inspect_dataset(data_dir: Path, plot_dir: Path) -> None:
         print(f"  {k:16s}: {len(ids)}")
 
     print("\n2. Preset counts & regime distribution:")
+    health = {"systems": len(df), "splits": {k: len(v) for k, v in splits.items()}, "presets": {}}
     for preset, grp in df.groupby("preset"):
         reg_counts = grp["regime_tag"].value_counts().to_dict()
         eff_mat = np.array([json.loads(s) for s in grp["effective_state_mask_json"]], dtype=float)
         surv_rates = {STATE_NAMES[i]: round(float(eff_mat[:, i].mean()), 2) for i in range(len(STATE_NAMES))}
         print(f"  {preset:28s} (n={len(grp):4d}): regimes={reg_counts}")
         print(f"    effective state survival: {surv_rates}")
+        params = pd.DataFrame([json.loads(s) for s in grp.params_json])
+        health["presets"][preset] = {
+            "n": len(grp), "fraction": len(grp) / len(df), "regimes": reg_counts,
+            "effective_state_fraction": dict(zip(STATE_NAMES, eff_mat.mean(axis=0).tolist())),
+            "parameter_quantiles": params.quantile([0, .05, .5, .95, 1]).to_dict(),
+        }
 
     print("\n3. Normalization summary (train-only):")
     for st in normalizer.stats:
@@ -86,13 +93,10 @@ def inspect_dataset(data_dir: Path, plot_dir: Path) -> None:
         x = np.asarray(root["x_true"][sid])
         r = np.asarray(root["r_true"][sid])
         gpp, er, nep = compute_macro_fluxes(r)
-        mask = json.loads(sub.iloc[0]["effective_state_mask_json"])
-
         ax_s = axes[row_idx, 0]
         for i, sname in enumerate(STATE_NAMES):
-            if mask[i]:
-                ax_s.plot(t_grid, x[:, i], label=sname, linewidth=1.1)
-        ax_s.set_title(f"{pname} (sys_id={sid}) - Active States")
+            ax_s.plot(t_grid, x[:, i], label=sname, linewidth=1.1)
+        ax_s.set_title(f"{pname} (sys_id={sid}) - Eight states")
         ax_s.set_xlabel("Time (days)")
         ax_s.set_ylabel("Concentration")
         ax_s.legend(ncol=4, fontsize=8)
@@ -147,6 +151,32 @@ def inspect_dataset(data_dir: Path, plot_dir: Path) -> None:
     fig.tight_layout()
     fig.savefig(plot_dir / "counterfactual_presets.png", dpi=150)
     plt.close(fig)
+    for preset, group in df.groupby("preset"):
+        selected = group.sample(n=min(5, len(group)), random_state=42)
+        health["presets"][preset]["plotted_system_ids"] = selected.sys_id.tolist()
+        fig, axes = plt.subplots(len(selected), len(STATE_NAMES), figsize=(19, 2.05 * len(selected)),
+                                 squeeze=False, sharex=True, layout="constrained")
+        for row_i, row in enumerate(selected.itertuples()):
+            sid = int(row.sys_id)
+            factual = np.asarray(root["x_true"][sid])
+            branch = np.asarray(root["x_cf"][sid])
+            action = json.loads(row.intervention_json)
+            for col, state in enumerate(STATE_NAMES):
+                ax = axes[row_i, col]
+                ax.plot(t_grid, factual[:, col], color="#215b86", linewidth=.8)
+                ax.plot(t_cf, branch[:, col], color="#c94d28", linestyle="--", linewidth=.85)
+                ax.axvline(180, color="0.55", linewidth=.65)
+                ax.tick_params(labelsize=7)
+                if row_i == 0:
+                    unit = "N" if state == "N" else ("O₂" if state == "O" else "C")
+                    ax.set_title(f"{state} (g {unit}/m³)", fontsize=9)
+                if col == 0:
+                    ax.set_ylabel(f"ID {sid}\n{action['type']}", fontsize=8)
+        fig.suptitle(f"{preset}    |    Baseline (blue) and intervention (dashed orange)")
+        fig.supxlabel("Time (days)")
+        fig.savefig(plot_dir / f"trajectories_{preset}.png", dpi=125)
+        plt.close(fig)
+    (plot_dir / "health.json").write_text(json.dumps(health, indent=2, allow_nan=False))
     print(f"\nSaved inspection plots to {plot_dir}/")
 
 

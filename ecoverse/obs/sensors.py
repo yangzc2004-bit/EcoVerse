@@ -9,9 +9,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import yaml
 
+from ecoverse.config import CONFIG_DIR
 from ecoverse.obs.normalize import Normalizer
-
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "configs"
 
 
 @lru_cache(maxsize=4)
@@ -215,10 +214,18 @@ def sample_observation(
         values_list.append(normed.astype(np.float32))
         is_drv_list.append(np.ones(sample_idx.shape[0], dtype=bool))
 
-    # Optional future intervention drivers for Test 3 counterfactual forecasting
+    # Reserve history tokens and spread future measurements across dates and time of day.
+    future_tokens = 0
     if future_u is not None and future_t_days is not None and future_u.shape[0] > 0:
-        fut_step = max(1, future_u.shape[0] // 180)
-        fut_idx = np.arange(0, future_u.shape[0], fut_step, dtype=np.int64)
+        n_times = min(180, len(future_t_days), max_tokens // (2 * max(1, n_drivers)))
+        phases = np.floor(np.remainder(future_t_days, 1.0) * 6 + 1e-3).astype(int) % 6
+        indices = []
+        if n_times:
+            for k, window in enumerate(np.array_split(np.arange(len(phases)), n_times)):
+                preferred = window[phases[window] == k % 6]
+                indices.append(rng.choice(preferred if preferred.size else window))
+        fut_idx = np.asarray(indices, dtype=np.int64)
+        future_tokens = len(fut_idx) * n_drivers
         for d_local in range(n_drivers):
             did_full = n_states + d_local
             raw = future_u[fut_idx, d_local].astype(np.float32)
@@ -233,20 +240,24 @@ def sample_observation(
     obs_values = np.concatenate(values_list)
     obs_is_driver = np.concatenate(is_drv_list)
 
+    history_size = len(obs_times) - future_tokens
+    history_budget = max_tokens - future_tokens
+    if history_size > history_budget:
+        kept_history = np.sort(rng.choice(history_size, size=history_budget, replace=False))
+        keep = np.concatenate((kept_history, np.arange(history_size, len(obs_times))))
+        obs_times = obs_times[keep]
+        obs_var_ids = obs_var_ids[keep]
+        obs_values = obs_values[keep]
+        obs_is_driver = obs_is_driver[keep]
+    obs_state_mask[:] = False
+    obs_state_mask[obs_var_ids[~obs_is_driver]] = True
+
     # Sort chronologically (stable sort preserves var_id ordering at equal timestamps)
     order = np.argsort(obs_times, kind="mergesort")
     obs_times = obs_times[order]
     obs_var_ids = obs_var_ids[order]
     obs_values = obs_values[order]
     obs_is_driver = obs_is_driver[order]
-
-    # Enforce token budget while preserving chronological order
-    if obs_times.shape[0] > max_tokens:
-        keep_idx = np.sort(rng.choice(obs_times.shape[0], size=max_tokens, replace=False))
-        obs_times = obs_times[keep_idx]
-        obs_var_ids = obs_var_ids[keep_idx]
-        obs_values = obs_values[keep_idx]
-        obs_is_driver = obs_is_driver[keep_idx]
 
     return {
         "obs_times": obs_times,

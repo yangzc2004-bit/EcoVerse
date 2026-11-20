@@ -45,7 +45,9 @@ def ecoverse_collate(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         "sys_id": torch.tensor([int(item["sys_id"]) for item in batch], dtype=torch.long),
     }
 
-    if "baseline_x" in batch[0]:
+    if "intervention" in batch[0]:
+        out["intervention"] = torch.stack([item["intervention"] for item in batch])
+    if all("baseline_x" in item for item in batch):
         out["baseline_x"] = torch.stack([item["baseline_x"] for item in batch], dim=0)
 
     return out

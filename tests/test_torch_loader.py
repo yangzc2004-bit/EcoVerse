@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -69,15 +70,13 @@ def _write_compact_config(path: Path) -> Path:
 
 
 def test_torch_loader_and_zero_leakage(tmp_path: Path) -> None:
-    cfg_path = _write_compact_config(tmp_path)
-    data_dir = tmp_path / "v0_small"
-    generate_dataset(
-        config_path=cfg_path,
-        output_dir=data_dir,
-        num_workers=4,
-        master_seed_override=202609,
-        progress=False,
-    )
+    if full_data := os.environ.get("ECOVERSE_ACCEPTANCE_DATA_DIR"):
+        data_dir = Path(full_data)
+    else:
+        cfg_path = _write_compact_config(tmp_path)
+        data_dir = tmp_path / "v0_small"
+        generate_dataset(config_path=cfg_path, output_dir=data_dir, num_workers=4,
+                         master_seed_override=202609, progress=False)
 
     # 1. Disjoint split verification
     split_mgr = SplitManager(data_dir)
@@ -108,7 +107,8 @@ def test_torch_loader_and_zero_leakage(tmp_path: Path) -> None:
         max_tokens=512,
         seed=99,
     )
-    sampler = RandomSampler(ds, replacement=True, num_samples=200 * 64)
+    sampler = RandomSampler(ds, replacement=True, num_samples=200 * 64,
+                            generator=torch.Generator().manual_seed(99))
     pin = torch.cuda.is_available()
     loader = DataLoader(
         ds,
@@ -118,6 +118,7 @@ def test_torch_loader_and_zero_leakage(tmp_path: Path) -> None:
         pin_memory=pin,
         persistent_workers=True,
         collate_fn=ecoverse_collate,
+        generator=torch.Generator().manual_seed(99),
     )
 
     if torch.cuda.is_available():
@@ -127,6 +128,8 @@ def test_torch_loader_and_zero_leakage(tmp_path: Path) -> None:
     else:
         device = torch.device("cpu")
 
+    live_bytes = []
+    batch_bytes = []
     n_batches = 0
     for raw_batch in loader:
         batch = {
@@ -156,11 +159,32 @@ def test_torch_loader_and_zero_leakage(tmp_path: Path) -> None:
             pad_mask = ~attn
             assert torch.all(batch["obs_values"][pad_mask] == 0.0)
             assert torch.all(batch["obs_times"][pad_mask] == 0.0)
+            del pad_mask
 
         assert torch.isfinite(batch["obs_values"]).all()
         assert torch.isfinite(batch["target_x"]).all()
         assert torch.isfinite(batch["target_r"]).all()
         n_batches += 1
+        sample_memory = n_batches % 10 == 0 and device.type in ("mps", "cuda")
+        if sample_memory:
+            backend = torch.mps if device.type == "mps" else torch.cuda
+            allocated = torch.mps.current_allocated_memory if device.type == "mps" else torch.cuda.memory_allocated
+            backend.synchronize()
+            batch_bytes.append(allocated())
+        del batch, attn
+        if sample_memory:
+            backend.synchronize()
+            live_bytes.append(allocated())
 
     assert n_batches == 200
+    if live_bytes:
+        assert all(before > after for before, after in zip(batch_bytes, live_bytes))
+        assert live_bytes[-1] <= live_bytes[0] + 1024**2
+    if out := os.environ.get("ECOVERSE_LOADER_REPORT"):
+        Path(out).write_text(json.dumps({
+            "device": str(device), "systems_in_train": len(ds), "batch_size": 64, "batches": n_batches,
+            "num_workers": 4, "persistent_workers": True, "pin_memory": pin,
+            "batch_device_bytes_every_10_batches": batch_bytes,
+            "live_device_bytes_every_10_batches": live_bytes,
+        }, indent=2))
     del loader

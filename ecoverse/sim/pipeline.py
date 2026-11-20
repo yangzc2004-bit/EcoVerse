@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sys
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -12,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import zarr
+from filelock import FileLock
 
 from ecoverse.bench.splits import build_splits_json
 from ecoverse.core.constants import (
@@ -58,7 +62,7 @@ def _run_candidate_worker(
     ) = task
     ss = np.random.SeedSequence([master_seed, group_id, attempt_idx])
     child_seed = int(ss.generate_state(1, dtype=np.uint64)[0])
-    rng = np.random.default_rng(ss)
+    rng = np.random.default_rng(child_seed)
 
     spec = sample_system_spec(
         preset_or_variant=preset_name,
@@ -87,6 +91,9 @@ def _run_candidate_worker(
     }
     meta_payload = {
         "seed": child_seed,
+        "shape_mode": shape_mode,
+        "interv_regime": interv_regime,
+        "spec": spec.model_dump(exclude={"sys_id"}),
         "preset": spec.preset,
         "split_tag": spec.split_tag,
         "regime_tag": qual.regime_tag,
@@ -144,7 +151,92 @@ def generate_dataset(
     progress: bool = True,
     config_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """Run deterministic dataset generation across all configured splits and groups."""
+    """Build a complete sibling dataset and publish it after successful validation."""
+    destination = Path(output_dir).absolute()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if scale <= 0 or num_workers < 1:
+        raise ValueError("scale and num_workers must be positive")
+    with tempfile.TemporaryDirectory(prefix=f".{destination.name}.build-", dir=destination.parent) as tmp:
+        stage = Path(tmp) / "dataset"
+        summary = _generate_in_directory(config_path, stage, num_workers, scale,
+                                         master_seed_override, progress, config_dir)
+        n = summary["n_total"]
+        rows = pd.read_parquet(stage / "metadata.parquet", columns=["sys_id"])
+        with (stage / "splits.json").open() as fh:
+            ids = [sid for group in json.load(fh).values() for sid in group]
+        root = zarr.open_group(str(stage / "trajectories.zarr"), mode="r")
+        if (not np.array_equal(rows["sys_id"].to_numpy(), np.arange(n))
+                or sorted(ids) != list(range(n))
+                or any(root[key].shape[0] != n for key in root.array_keys())):
+            raise ValueError("Inconsistent system IDs or incomplete trajectory arrays")
+        Normalizer.load(stage / "norm_stats.json")
+        summary["output_dir"] = str(output_dir)
+        (stage / "generation_summary.json").write_text(json.dumps(summary, indent=2))
+        _publish_dataset(stage, destination)
+    return summary
+
+
+def _publish_dataset(stage: Path, destination: Path) -> None:
+    """Serialize publishers. Exchange directories atomically on macOS and Linux."""
+    import ctypes
+    import errno
+
+    previous = destination.with_name(f".{destination.name}.previous")
+    journal = destination.with_name(f".{destination.name}.publishing")
+    with FileLock(str(destination.with_name(f".{destination.name}.publish.lock"))):
+        # Recover an interrupted two-rename publication on other filesystems.
+        if journal.exists():
+            if journal.read_text() != destination.name:
+                raise ValueError(f"Unexpected publication journal at {journal}")
+            if previous.exists():
+                if destination.exists():
+                    shutil.rmtree(previous)
+                else:
+                    previous.rename(destination)
+            journal.unlink()
+        if not destination.exists():
+            stage.rename(destination)
+            return
+        if destination.is_symlink() or not destination.is_dir():
+            raise ValueError(f"Expected a dataset directory at {destination}")
+        unexpected = {p.name for p in destination.iterdir()} - {p.name for p in stage.iterdir()}
+        if unexpected:
+            raise ValueError(f"Preserving unrelated files in {destination}: {sorted(unexpected)}")
+        libc = ctypes.CDLL(None, use_errno=True)
+        names = os.fsencode(stage), os.fsencode(destination)
+        if sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+            ret = libc.renamex_np(*names, 2)  # RENAME_SWAP
+        elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+            ret = libc.renameat2(-100, names[0], -100, names[1], 2)  # RENAME_EXCHANGE
+        else:
+            ret = None
+        if ret == 0:
+            return
+        if ret is not None:
+            error = ctypes.get_errno()
+            if error not in (errno.ENOSYS, errno.ENOTSUP, errno.EINVAL):
+                raise OSError(error, os.strerror(error), destination)
+        if previous.exists():
+            raise FileExistsError(f"Backup path is already in use: {previous}")
+        journal.write_text(destination.name)
+        try:
+            destination.rename(previous)
+            try:
+                stage.rename(destination)
+            except BaseException:
+                previous.rename(destination)
+                raise
+            shutil.rmtree(previous)
+        finally:
+            if destination.exists() and not previous.exists():
+                journal.unlink()
+
+
+def _generate_in_directory(
+    config_path: Optional[Path], output_dir: Path, num_workers: int, scale: float,
+    master_seed_override: Optional[int], progress: bool, config_dir: Optional[Path],
+) -> Dict[str, Any]:
+    """Write all artifacts into a private build directory."""
     cdir = Path(config_dir) if config_dir else CONFIG_DIR
     cfg_file = Path(config_path) if config_path else (cdir / "benchmark_v0.yaml")
     bench_cfg = load_yaml(cfg_file)
@@ -176,6 +268,8 @@ def generate_dataset(
 
     root = zarr.open_group(str(zarr_path), mode="w")
     root.attrs["version"] = str(bench_cfg.get("version", "v0.1.0"))
+    root.attrs["master_seed"] = master_seed
+    root.attrs["seed_scheme"] = "SeedSequence(master_seed, group_id, attempt_idx) -> uint64 -> default_rng"
     root.attrs["state_names"] = list(STATE_NAMES)
     root.attrs["driver_names"] = list(DRIVER_NAMES)
     root.attrs["channel_names"] = list(CHANNEL_NAMES)
@@ -226,7 +320,6 @@ def generate_dataset(
             attempts_total = 0
             fail_counts: Dict[str, int] = {}
             solve_times: List[float] = []
-            batch_size = max(16, num_workers * 4) if num_workers > 1 else 16
 
             while accepted < target_cnt:
                 # Deterministic batching: run fixed batch, sort by attempt_idx, take in order
@@ -281,6 +374,9 @@ def generate_dataset(
                         {
                             "sys_id": sys_id,
                             "seed": int(meta["seed"]),
+                            "shape_mode": meta["shape_mode"],
+                            "interv_regime": meta["interv_regime"],
+                            "spec_json": json.dumps(dict(meta["spec"], sys_id=sys_id)),
                             "preset": str(meta["preset"]),
                             "split_tag": str(meta["split_tag"]),
                             "regime_tag": str(meta["regime_tag"]),
@@ -297,7 +393,7 @@ def generate_dataset(
                     if accepted >= target_cnt:
                         break
 
-                if attempts_total > max(500, target_cnt * 100) and accepted == 0:
+                if attempts_total > max(500, target_cnt * 100) and accepted < target_cnt:
                     raise RuntimeError(
                         f"Too many failures for {split_tag}/{grp_name}: {fail_counts}"
                     )

@@ -65,6 +65,7 @@ CHANNEL_NAMES: Tuple[str, ...] = (
 )
 
 GPP_CHANNELS: Tuple[int, ...] = (0, 1)
+SIGNED_FLUX_CHANNELS: Tuple[int, ...] = (16, 17)
 ER_CHANNELS: Tuple[int, ...] = (2, 3, 11, 12, 15, 21)
 CLOSED_CHANNELS: Tuple[int, ...] = tuple(range(16))
 OPEN_CHANNELS: Tuple[int, ...] = tuple(range(16, 23))
@@ -74,8 +75,8 @@ Z2_CHANNELS: Tuple[int, ...] = (8, 12, 14)
 # ---------------------------------------------------------------------------
 # Physical stoichiometry & temporal grid constants
 # ---------------------------------------------------------------------------
-ALPHA_N: float = 0.15       # Redfield N:C mass ratio (g N / g C)
-ALPHA_O: float = 2.67       # Redfield O2:C mass ratio (g O2 / g C)
+ALPHA_N: float = 0.15       # Model N:C mass ratio (g N / g C)
+ALPHA_O: float = 2.67       # Model O2:C mass ratio (g O2 / g C)
 GATE_EPS: float = 0.1       # Half-saturation for smooth positivity gating g_O, g_C
 
 BURNIN_DAYS: float = 180.0
@@ -137,6 +138,13 @@ INTERV_MAP = {
     "bio_pulse": INTERV_BIO_PULSE,
 }
 INTERV_INV = {v: k for k, v in INTERV_MAP.items()}
+
+# One-hot action, normalized day and offsets from the no-action controls.
+INTERVENTION_FEATURES = (
+    "nutrient_step", "warming_shift", "flow_regime", "bio_pulse", "t_int",
+    "lambda_N_minus_one", "delta_T", "lambda_q_minus_one", "lambda_storm_minus_one",
+    "kappa_P1_minus_one", "kappa_Z1_minus_one",
+)
 
 ArrayLike = TypeVar("ArrayLike", bound=object)
 

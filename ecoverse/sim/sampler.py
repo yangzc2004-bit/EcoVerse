@@ -9,12 +9,10 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import yaml
 
+from ecoverse.config import CONFIG_DIR
 from ecoverse.core.constants import P2_CHANNELS, STATE_NAMES
 from ecoverse.core.shapes import o_sat_freshwater
 from ecoverse.core.spec import ForcingSpec, InterventionSpec, SystemSpec
-
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "configs"
-
 
 def load_yaml(path: Path) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as fh:

@@ -100,8 +100,8 @@ def compute_flux_r2(
             per_channel[j] = r2_j
             vals.append(r2_j)
 
-    pred_gpp, pred_er, pred_nep = compute_macro_fluxes(pred_r)
-    true_gpp, true_er, true_nep = compute_macro_fluxes(true_r)
+    pred_gpp, pred_er, pred_nep = compute_macro_fluxes(pred_r.masked_fill(~cmask, 0))
+    true_gpp, true_er, true_nep = compute_macro_fluxes(true_r.masked_fill(~cmask, 0))
 
     gpp_r2 = _safe_r2(pred_gpp.reshape(-1), true_gpp.reshape(-1))
     er_r2 = _safe_r2(pred_er.reshape(-1), true_er.reshape(-1))

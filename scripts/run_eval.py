@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from pathlib import Path
 from typing import Dict, Tuple
@@ -10,7 +11,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 from ecoverse.bench.metrics import (
     compute_counterfactual_metrics,
@@ -20,6 +21,7 @@ from ecoverse.bench.metrics import (
 )
 from ecoverse.bench.probe import compare_pretrained_vs_random_probe
 from ecoverse.bench.splits import SplitManager
+from ecoverse.core.constants import INTERVENTION_FEATURES, SIGNED_FLUX_CHANNELS
 from ecoverse.obs.collate import ecoverse_collate
 from ecoverse.obs.dataset import EcoVerseDataset
 from ecoverse.obs.normalize import Normalizer
@@ -72,7 +74,12 @@ class EventStreamBaseline(nn.Module):
         )
         self.state_head = nn.Linear(d_model, n_states)
         self.rate_head = nn.Linear(d_model, n_channels)
+        self.action_proj = nn.Linear(len(INTERVENTION_FEATURES), d_model, bias=False)
+        signed = torch.tensor([j in SIGNED_FLUX_CHANNELS for j in range(n_channels)])
+        self.register_buffer("signed_channels", signed)
         nn.init.constant_(self.rate_head.bias, -3.0)
+        with torch.no_grad():
+            self.rate_head.bias[signed] = 0
 
     def encode(
         self,
@@ -102,11 +109,14 @@ class EventStreamBaseline(nn.Module):
             batch["obs_is_driver"],
             batch["obs_attn_mask"],
         )  # (B, D)
+        if "intervention" in batch:
+            z_sys = z_sys + self.action_proj(batch["intervention"])
         qt = batch["query_times"].unsqueeze(-1)  # (B, Q, 1)
         z_exp = z_sys.unsqueeze(1).expand(-1, qt.shape[1], -1)
         z_t = self.query_net(torch.cat([z_exp, qt], dim=-1))  # (B, Q, D)
         pred_x = self.state_head(z_t)
-        pred_r = F.softplus(self.rate_head(z_t))
+        raw_r = self.rate_head(z_t)
+        pred_r = torch.where(self.signed_channels, raw_r, F.softplus(raw_r))
         return pred_x, pred_r, z_sys, z_t
 
 
@@ -125,8 +135,12 @@ def _train_baseline(
     device: torch.device,
     epochs: int,
     lr: float = 1e-3,
-) -> None:
+) -> dict:
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    history = []
+    best_val = float("inf")
+    best_epoch = 0
+    best_state = None
     for ep in range(1, epochs + 1):
         model.train()
         tot_loss = 0.0
@@ -139,7 +153,7 @@ def _train_baseline(
             loss_x = F.mse_loss(pred_x[mask_x], batch["target_x"][mask_x])
             mask_r = batch["channel_mask"].unsqueeze(1).expand_as(pred_r)
             loss_r = F.mse_loss(
-                torch.log1p(pred_r[mask_r]), torch.log1p(torch.clamp(batch["target_r"][mask_r], min=0.0))
+                torch.asinh(pred_r[mask_r]), torch.asinh(batch["target_r"][mask_r])
             )
             loss = loss_x + 0.5 * loss_r
             loss.backward()
@@ -149,15 +163,26 @@ def _train_baseline(
             n_batches += 1
 
         model.eval()
-        val_losses = []
+        val_error = 0.0
+        val_count = 0
         with torch.no_grad():
             for raw_batch in val_loader:
                 batch = _to_device(raw_batch, device)
                 pred_x, _, _, _ = model(batch)
                 mask_x = batch["target_state_mask"].unsqueeze(1).expand_as(pred_x)
-                val_losses.append(float(F.mse_loss(pred_x[mask_x], batch["target_x"][mask_x]).item()))
-        mean_val = sum(val_losses) / max(len(val_losses), 1)
+                val_error += float(F.mse_loss(pred_x[mask_x], batch["target_x"][mask_x], reduction="sum"))
+                val_count += int(mask_x.sum())
+        mean_val = val_error / max(val_count, 1)
+        history.append(dict(epoch=ep, train_loss=tot_loss / max(n_batches, 1), val_state_mse=mean_val))
+        if mean_val < best_val:
+            best_val, best_epoch = mean_val, ep
+            best_state = copy.deepcopy(model.state_dict())
         print(f"  Epoch {ep}/{epochs} | train_loss={tot_loss / max(n_batches, 1):.4f} | val_x_mse={mean_val:.4f}")
+        if ep - best_epoch >= 3:
+            break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return {"history": history, "selected_epoch": best_epoch, "patience": 3}
 
 
 @torch.no_grad()
@@ -172,7 +197,6 @@ def _collect_predictions(
         "target_state_mask", "obs_state_mask", "channel_mask", "z_sys", "z_t",
     ]
     buckets: Dict[str, list[torch.Tensor]] = {k: [] for k in keys}
-    has_base = False
     base_list = []
 
     for raw_batch in loader:
@@ -188,11 +212,10 @@ def _collect_predictions(
         buckets["z_sys"].append(z_sys.cpu())
         buckets["z_t"].append(z_t.cpu())
         if "baseline_x" in batch:
-            has_base = True
             base_list.append(batch["baseline_x"].cpu())
 
     out = {k: torch.cat(v, dim=0) for k, v in buckets.items()}
-    if has_base:
+    if len(base_list) == len(buckets["pred_x"]):
         out["baseline_x"] = torch.cat(base_list, dim=0)
     return out
 
@@ -209,16 +232,15 @@ def run_benchmark_eval(
     torch.manual_seed(seed)
     device = _select_device(device_str)
     pin = device.type == "cuda"
-    persist = num_workers > 0
 
     print(f"Running EcoVerse Benchmark Evaluation on device={device} (data={data_dir})")
     split_mgr = SplitManager(data_dir)
     normalizer = Normalizer.load(data_dir / "norm_stats.json")
 
-    def _make_loader(split_name: str, mode: str, pkg: str, shuffle: bool, num_q: int = 32) -> DataLoader:
-        ds = EcoVerseDataset(
+    def dataset(ids, mode, pkg, num_q=32):
+        return EcoVerseDataset(
             data_dir=data_dir,
-            sys_ids=split_mgr.get_ids(split_name),
+            sys_ids=ids,
             mode=mode,
             sensor_package=pkg,
             num_queries=num_q,
@@ -226,49 +248,63 @@ def run_benchmark_eval(
             normalizer=normalizer,
             seed=seed,
         )
+
+    def loader(ds, shuffle=False, persistent=False):
         return DataLoader(
             ds,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
             pin_memory=pin,
-            persistent_workers=persist,
+            persistent_workers=persistent and num_workers > 0,
             collate_fn=ecoverse_collate,
         )
 
-    train_loader = _make_loader("train", "train", "random", shuffle=True, num_q=32)
-    val_loader = _make_loader("val", "eval", "random", shuffle=False, num_q=32)
+    train_ids = split_mgr.get_ids("train")
+    val_ids = split_mgr.get_ids("val")
+    factual_train = dataset(train_ids, "train", "random")
+    train_loader = loader(ConcatDataset([factual_train, dataset(train_ids, "counterfactual_train", "random")]),
+                          shuffle=True, persistent=True)
+    val_loader = loader(ConcatDataset([dataset(val_ids, "eval", "random"),
+                                       dataset(val_ids, "counterfactual", "random")]), persistent=True)
 
     n_states = normalizer.n_states
     n_vars = normalizer.n_states + normalizer.n_drivers
-    n_channels = train_loader.dataset.n_channels  # type: ignore[attr-defined]
+    n_channels = factual_train.n_channels
 
     model = EventStreamBaseline(n_vars=n_vars, n_states=n_states, n_channels=n_channels).to(device)
     random_model = EventStreamBaseline(n_vars=n_vars, n_states=n_states, n_channels=n_channels).to(device)
 
     print("Training baseline EventStreamBaseline...")
-    _train_baseline(model, train_loader, val_loader, device, epochs=epochs)
+    training = _train_baseline(model, train_loader, val_loader, device, epochs=epochs)
 
-    report: Dict[str, object] = {"device": str(device), "epochs": epochs, "splits": split_mgr.summary()}
+    del train_loader, val_loader
+    report: Dict[str, object] = {
+        "device": str(device), "epochs": epochs, "seed": seed, "batch_size": batch_size,
+        "num_workers": num_workers, "max_tokens": 512, "splits": split_mgr.summary(),
+        "training_views_per_epoch": {"factual": len(train_ids), "counterfactual": len(train_ids)},
+        "training": training,
+    }
 
     # Test 1: Cross-observation reconstruction & alignment (Packages A, B, C)
     print("\n[Test 1] Evaluating test_1_obs across Packages A / B / C...")
     pkg_results = {}
     z_by_pkg: Dict[str, torch.Tensor] = {}
     for pkg in ("A", "B", "C"):
-        ldr = _make_loader("test_1_obs", "eval", pkg, shuffle=False, num_q=32)
+        ldr = loader(dataset(split_mgr.get_ids("test_1_obs"), "eval", pkg))
         out = _collect_predictions(model, ldr, device)
         unobs_mask = out["target_state_mask"] & (~out["obs_state_mask"])
-        if int(unobs_mask.sum().item()) == 0:
-            unobs_mask = out["target_state_mask"]
         nrmse_unobs = compute_masked_nrmse(out["pred_x"], out["target_x"], unobs_mask)
         flux_r2 = compute_flux_r2(out["pred_r"], out["target_r"], out["channel_mask"])
         z_by_pkg[pkg] = out["z_sys"]
         pkg_results[pkg] = {
             "unobs_overall_nrmse": nrmse_unobs["overall_nrmse"],
+            "n_unobserved_state_system_pairs": int(unobs_mask.sum()),
             "mean_flux_r2": flux_r2["mean_channel_r2"],
             "gpp_r2": flux_r2["gpp_r2"],
             "er_r2": flux_r2["er_r2"],
+            "nep_r2": flux_r2["nep_r2"],
+            "per_channel_r2": {j: flux_r2["per_channel_r2"].get(j) for j in range(n_channels)},
         }
     align = compute_cross_obs_alignment(z_by_pkg)
     report["test_1_obs"] = {"packages": pkg_results, "alignment": align}
@@ -276,7 +312,7 @@ def run_benchmark_eval(
     # Tests 2a, 2b, 2c: Zero-shot generalization
     for sname in ("test_2a_param", "test_2b_comp", "test_2c_shape"):
         print(f"[Test {sname}] Evaluating...")
-        ldr = _make_loader(sname, "eval", "B", shuffle=False, num_q=32)
+        ldr = loader(dataset(split_mgr.get_ids(sname), "eval", "B"))
         out = _collect_predictions(model, ldr, device)
         nrmse = compute_masked_nrmse(out["pred_x"], out["target_x"], out["target_state_mask"])
         flux = compute_flux_r2(out["pred_r"], out["target_r"], out["channel_mask"])
@@ -286,11 +322,16 @@ def run_benchmark_eval(
             "mean_flux_r2": flux["mean_channel_r2"],
             "gpp_r2": flux["gpp_r2"],
             "er_r2": flux["er_r2"],
+            "nep_r2": flux["nep_r2"],
+            "per_channel_r2": {j: flux["per_channel_r2"].get(j) for j in range(n_channels)},
         }
+    report["test_2c_shape"]["delta_nrmse_vs_2a"] = (
+        report["test_2c_shape"]["overall_nrmse"] - report["test_2a_param"]["overall_nrmse"]
+    )
 
     # Test 3: Counterfactual intervention forecasting
     print("[Test 3] Evaluating test_3_interv counterfactual forecasting...")
-    cf_ldr = _make_loader("test_3_interv", "counterfactual", "A", shuffle=False, num_q=32)
+    cf_ldr = loader(dataset(split_mgr.get_ids("test_3_interv"), "counterfactual", "A"))
     cf_out = _collect_predictions(model, cf_ldr, device)
     cf_metrics = compute_counterfactual_metrics(
         cf_out["pred_x"], cf_out["target_x"], cf_out["baseline_x"], cf_out["target_state_mask"]
@@ -299,51 +340,14 @@ def run_benchmark_eval(
 
     # Test 4: GPU Linear Probe (Pretrained vs Random Untrained Control)
     print("[Test 4] Running GPU Linear Probe (pretrained vs random initialization)...")
-    train_probe_ids = split_mgr.get_ids("train")[: min(200, len(split_mgr.get_ids("train")))]
-    eval_probe_ids = (
-        split_mgr.get_ids("test_1_obs")
-        + split_mgr.get_ids("test_2a_param")
-        + split_mgr.get_ids("test_2b_comp")
-        + split_mgr.get_ids("test_2c_shape")
-    )
-    probe_fit_ds = EcoVerseDataset(
-        data_dir=data_dir,
-        sys_ids=train_probe_ids,
-        mode="eval",
-        sensor_package="A",
-        num_queries=16,
-        max_tokens=512,
-        normalizer=normalizer,
-        seed=seed,
-    )
-    probe_eval_ds = EcoVerseDataset(
-        data_dir=data_dir,
-        sys_ids=eval_probe_ids,
-        mode="eval",
-        sensor_package="A",
-        num_queries=16,
-        max_tokens=512,
-        normalizer=normalizer,
-        seed=seed,
-    )
-    probe_fit_ldr = DataLoader(
-        probe_fit_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin,
-        persistent_workers=persist,
-        collate_fn=ecoverse_collate,
-    )
-    probe_eval_ldr = DataLoader(
-        probe_eval_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin,
-        persistent_workers=persist,
-        collate_fn=ecoverse_collate,
-    )
+    train_probe_ids = split_mgr.stratified_ids("train", limit=200, seed=seed)
+    probe_fit_ldr = loader(dataset(train_probe_ids, "eval", "A", 16))
+    test_splits = [name for name in split_mgr.splits if name.startswith("test_")]
+    probe_sets = [
+        dataset(split_mgr.get_ids(name), "counterfactual" if name == "test_3_interv" else "eval", "A", 16)
+        for name in test_splits
+    ]
+    probe_eval_ldr = loader(ConcatDataset(probe_sets))
 
     fit_pre = _collect_predictions(model, probe_fit_ldr, device)
     eval_pre = _collect_predictions(model, probe_eval_ldr, device)
@@ -361,6 +365,12 @@ def run_benchmark_eval(
         Z_tr_pre, Z_ev_pre, Z_tr_rnd, Z_ev_rnd, R_tr, R_ev, device=device
     )
     report["test_4_probe"] = {
+        "train_sys_ids": train_probe_ids,
+        "eval_systems_by_split": {name: len(ds) for name, ds in zip(test_splits, probe_sets)},
+        "per_channel_r2_pretrain": {j: probe_res["pretrain_detail"]["per_channel_r2"].get(j)
+                                    for j in range(n_channels)},
+        "per_channel_r2_random": {j: probe_res["random_detail"]["per_channel_r2"].get(j)
+                                  for j in range(n_channels)},
         "r2_pretrain": probe_res["r2_pretrain"],
         "r2_random": probe_res["r2_random"],
         "delta_r2": probe_res["delta_r2"],
@@ -370,6 +380,9 @@ def run_benchmark_eval(
         "er_r2_pretrain": probe_res["er_r2_pretrain"],
         "er_r2_random": probe_res["er_r2_random"],
         "er_delta_r2": probe_res["er_delta_r2"],
+        "nep_r2_pretrain": probe_res["nep_r2_pretrain"],
+        "nep_r2_random": probe_res["nep_r2_random"],
+        "nep_delta_r2": probe_res["nep_delta_r2"],
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

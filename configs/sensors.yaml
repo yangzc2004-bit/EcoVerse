@@ -27,7 +27,7 @@ packages:
     preferred_states: ["P1", "O"]
     fallback_states: ["P1", "Z1"]
     pick_single_state: true
-    drivers: ["I", "T"]
+    drivers: []
     mean_interval_days: [1.5, 4.0]
     noise_type: "lognormal"
     noise_sigma: 0.06

@@ -43,13 +43,20 @@ def classify_regime(
     if not bio_idx:
         return "forced_periodic"
 
-    # 1. Check for persistent regime shift between early and late equal-season windows
+    # Remove the annual cycle before comparing the ends of a one-year record.
+    days = np.arange(len(x_true)) * DT_DAYS
+    seasonal_basis = np.column_stack([fn(2 * np.pi * days * harmonic / 365)
+                                      for harmonic in (1, 2) for fn in (np.sin, np.cos)])
     win = 180  # 30 days at 4h resolution
     for i in bio_idx:
         series = x_true[:, i].astype(np.float64)
         mean_all = float(np.mean(series))
         if mean_all < 1e-4:
             continue
+        if forcing.seasonal:
+            centered = series - mean_all
+            periodic = seasonal_basis @ np.linalg.lstsq(seasonal_basis, centered, rcond=None)[0]
+            series -= periodic
         early = series[:win]
         late = series[-win:]
         m_early = float(np.mean(early))
@@ -60,19 +67,19 @@ def classify_regime(
             return "regime_shift"
 
     # 2. Spectral separation between external forcing bands and endogenous oscillation bands
-    if not forcing.seasonal and not forcing.diel:
-        return "endogenous_oscillation"
-
     n_t = x_true.shape[0]
     freqs = np.fft.rfftfreq(n_t, d=DT_DAYS)  # cycles per day
 
     # Forced bands: annual + harmonic (<= 0.008 d^-1) and diel (~1.0, 2.0 d^-1)
     forced_mask = (freqs > 0.0) & (
-        (freqs <= 0.008)
-        | (np.abs(freqs - 1.0) <= 0.08)
-        | (np.abs(freqs - 2.0) <= 0.08)
+        (forcing.seasonal & (freqs <= 0.008))
+        | (forcing.diel & (np.abs(freqs - 1.0) <= 0.08))
+        | (forcing.diel & (np.abs(freqs - 2.0) <= 0.08))
     )
-    endo_mask = (freqs > 0.008) & (np.abs(freqs - 1.0) > 0.08) & (np.abs(freqs - 2.0) > 0.08) & (freqs <= 0.90)
+    for amplitude, freq in zip(forcing.cloud_w + forcing.temp_v, forcing.cloud_f + forcing.temp_g):
+        if amplitude:
+            forced_mask |= (freqs > 0) & (np.abs(freqs - freq) <= 1 / (n_t * DT_DAYS))
+    endo_mask = (freqs > 0.008) & ~forced_mask & (freqs <= 0.90)
 
     endo_powers = []
     forced_powers = []

@@ -164,6 +164,7 @@ class SystemSpec(BaseModel):
             "K_P2",
             "K_Z1",
             "K_D",
+            "K_I_N1", "K_I_N2", "K_I_P1", "K_I_P2", "K_I_Z1", "K_I_ratio",
             "I_k",
             "I_opt",
             "sigma_T",

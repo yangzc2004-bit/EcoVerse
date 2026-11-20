@@ -70,3 +70,11 @@ class SplitManager:
 
     def summary(self) -> Dict[str, int]:
         return {k: len(v) for k, v in self.splits.items()}
+
+    def stratified_ids(self, split_name: str, limit: int, seed: int) -> List[int]:
+        """Sample in balanced rounds over presets, with deterministic within-preset order."""
+        rows = pd.read_parquet(self.data_dir / "metadata.parquet", columns=["sys_id", "preset"])
+        rows = rows.set_index("sys_id").loc[self.get_ids(split_name)]
+        shuffled = rows.sample(frac=1, random_state=seed)
+        order = shuffled.groupby("preset").cumcount().sort_values(kind="stable").index
+        return order[:limit].tolist()
